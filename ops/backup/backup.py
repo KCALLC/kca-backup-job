@@ -5,6 +5,11 @@ For each database in $DATABASES: pg_dump -Fc | age -r <public key> -> upload to
 B2 bucket $B2_BUCKET at pg/<db>/<db>-<UTC timestamp>.dump.age, then verify the
 uploaded size and SHA-1 against the local file. Any failure exits non-zero.
 
+Large files: b2sdk uploads files above B2's recommendedPartSize (100 MB) as B2 "large files",
+which have contentSha1 "none"; the whole-file SHA-1 we pass is stored in fileInfo
+large_file_sha1 instead. remote_sha1() reads that, so a >100 MB dump verifies like any other
+(2026-10-07: ci_springs 130 MB made invocation 8cbc1209 exit 1 after all 6 uploads succeeded).
+
 Environment (set as App Platform SECRET envs, never in git):
   PGHOST PGPORT PGUSER PGPASSWORD  -- admin connection (PGSSLMODE=require)
   DATABASES                        -- comma-separated, e.g. "springs,gorman"
@@ -32,6 +37,19 @@ def need(name: str) -> str:
         log(f"FATAL: missing env {name}")
         sys.exit(2)
     return v
+
+
+def remote_sha1(content_sha1, file_info):
+    """Whole-file SHA-1 B2 holds for an uploaded file version, or None.
+
+    Small files: contentSha1 (possibly prefixed "unverified:"). Large files (multi-part):
+    contentSha1 is "none" and the whole-file SHA-1 is fileInfo["large_file_sha1"]."""
+    s = content_sha1 or ""
+    if s.startswith("unverified:"):
+        s = s[len("unverified:"):]
+    if s and s != "none":
+        return s
+    return (file_info or {}).get("large_file_sha1")
 
 
 def main() -> int:
@@ -88,8 +106,10 @@ def main() -> int:
                 file_info={"db": db, "pg_dump_format": "custom", "encryption": "age", "utc": stamp},
             )
             remote = b2.get_file_info(fv.id_)
-            if remote.size != size or remote.content_sha1 != sha1:
-                log(f"{db}: FAILED verification remote size={remote.size} sha1={remote.content_sha1}")
+            rsha1 = remote_sha1(remote.content_sha1, remote.file_info)
+            if remote.size != size or rsha1 != sha1:
+                log(f"{db}: FAILED verification remote size={remote.size} sha1={remote.content_sha1} "
+                    f"large_file_sha1={(remote.file_info or {}).get('large_file_sha1')}")
                 failures += 1
                 continue
             log(f"{db}: OK uploaded fileId={fv.id_} size={size:,} sha1={sha1} ({time.time()-t1:.1f}s)")
